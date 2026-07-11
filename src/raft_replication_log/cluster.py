@@ -168,7 +168,19 @@ class Cluster:
         return result
 
     def current_leader(self) -> NodeId | None:
-        leaders = [node for node in self.nodes.values() if node.role == RaftRole.LEADER]
+        """El líder utilizable ahora mismo: excluye nodos caídos, a
+        diferencia de `leaders_by_term` (que sí los incluye a propósito,
+        porque un nodo caído que todavía "cree" ser líder de un término
+        viejo es justo lo que el chequeo de split-brain necesita poder
+        ver). Un nodo caído nunca deja de tener `role == LEADER` por sí
+        mismo mientras esté caído (no recibe ticks ni RPCs que lo hagan
+        cambiar de idea), así que sin este filtro un líder muerto seguiría
+        "reportándose" como el líder del cluster para siempre."""
+        leaders = [
+            node
+            for node_id, node in self.nodes.items()
+            if node.role == RaftRole.LEADER and node_id not in self._down
+        ]
         if not leaders:
             return None
         return max(leaders, key=lambda node: node.current_term).node_id

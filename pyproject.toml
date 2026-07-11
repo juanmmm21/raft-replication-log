@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "raft-replication-log"
+version = "0.1.0"
+description = "A from-scratch Raft consensus implementation for leader election and replicated log commitment."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Juan Martos Cuevas", email = "martoscuevasjuan@gmail.com" }]
+
+[project.urls]
+Repository = "https://github.com/juanmmm21/raft-replication-log"
+
+[project.scripts]
+raft-replication-log = "raft_replication_log.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/raft_replication_log"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]

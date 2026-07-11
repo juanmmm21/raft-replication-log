@@ -201,6 +201,17 @@ class RaftNode:
         self.next_index = {peer: self.last_log_index() + 1 for peer in self.peer_ids}
         self.match_index = {peer: 0 for peer in self.peer_ids}
         self._heartbeat_elapsed = 0
+        # Entrada no-op de término (§5.4.2 del paper de Raft): un líder
+        # nuevo solo puede comprometer directamente entradas de SU PROPIO
+        # término (regla de seguridad en `replication._advance_commit_index`);
+        # entradas de términos anteriores solo se comprometen de forma
+        # indirecta, cuando una entrada del término actual alcanza quorum.
+        # Sin este no-op, un líder que hereda un log con entradas sin
+        # comprometer de un término viejo se queda bloqueado para siempre
+        # si no llega ningún cliente a proponer nada nuevo -- se detectó
+        # así, con un cluster que dejaba de progresar tras converger todos
+        # los reintentos de un test de propiedades sin más propuestas.
+        replication.propose(self, b"")
         self.send_append_entries_to_all_peers()
 
     def reset_election_timer(self) -> None:
@@ -224,7 +235,12 @@ class RaftNode:
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             entry = self.entry_at(self.last_applied)
-            if entry is not None:
+            # `command == b""` marca la entrada no-op que `become_leader`
+            # añade a cada término nuevo (ver su docstring): existe solo
+            # para poder comprometer indirectamente entradas de términos
+            # anteriores, nunca representa un comando real de cliente, así
+            # que no se envía a la máquina de estados.
+            if entry is not None and entry.command != b"":
                 self.state_machine.apply(entry.command)
         if self.snapshot_threshold is not None:
             already_compacted = self.snapshot.last_included_index if self.snapshot else 0

@@ -185,8 +185,12 @@ def test_leader_only_commits_current_term_entries_directly() -> None:
 def test_end_to_end_quorum_replication_via_cluster() -> None:
     cluster = make_cluster(size=5, seed=2)
     leader_id = pipeline.elect_leader(cluster)
+    # El índice devuelto no tiene por qué ser 1: `become_leader` ya
+    # comprometió una entrada no-op de término al asumir el liderazgo
+    # (ver su docstring en node.py), así que el primer comando real de
+    # cliente ocupa el índice siguiente a ese no-op.
     index = pipeline.replicate_command(cluster, b"SET x=1")
-    assert index == 1
+    assert index >= 1
     leader = cluster.nodes[leader_id]
     assert leader.commit_index >= 1
     assert leader.state_machine.applied_commands == (b"SET x=1",)  # type: ignore[attr-defined]

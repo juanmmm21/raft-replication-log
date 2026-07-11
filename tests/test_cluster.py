@@ -74,7 +74,7 @@ def test_recovery_after_follower_crash() -> None:
 def test_recovery_after_leader_crash_elects_new_leader_and_keeps_committed_entries() -> None:
     cluster = make_cluster(size=5, seed=14)
     leader_id = pipeline.elect_leader(cluster)
-    pipeline.replicate_command(cluster, b"SET a=1")
+    index_a = pipeline.replicate_command(cluster, b"SET a=1")
     old_term = cluster.nodes[leader_id].current_term
 
     cluster.crash_node(leader_id)
@@ -82,10 +82,10 @@ def test_recovery_after_leader_crash_elects_new_leader_and_keeps_committed_entri
     assert new_leader_id != leader_id
     assert cluster.nodes[new_leader_id].current_term > old_term
 
-    index = pipeline.replicate_command(cluster, b"SET b=2")
-    assert index == 2
+    index_b = pipeline.replicate_command(cluster, b"SET b=2")
+    assert index_b > index_a
     # la entrada comprometida antes de la caída sobrevive (leader completeness)
-    assert cluster.nodes[new_leader_id].entry_at(1).command == b"SET a=1"  # type: ignore[union-attr]
+    assert cluster.nodes[new_leader_id].entry_at(index_a).command == b"SET a=1"  # type: ignore[union-attr]
 
     cluster.recover_node(leader_id)
     cluster.tick(60)

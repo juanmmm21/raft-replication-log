@@ -69,7 +69,55 @@ A direct consequence of that same rule: a brand-new leader that inherits an *unc
 
 ### The simulated cluster: no threads, no sockets, one process
 
-`Cluster` is the single implementation of the `Transport` protocol nodes are injected with. Every "RPC" a node sends is, in reality, a direct synchronous function call — `node.transport.send_append_entries(...)` immediately calls the target `RaftNode`'s handler and returns its response (or `None`, standing in for a dropped/timed-out message). This is a deliberate scope decision, spelled out in `cluster.py`'s module docstring: this repo models *the consensus protocol itself*, not a real network stack, so there is nothing to gain from sockets or `asyncio` — and, unlike `lock-manager-deadlock-detector` (which genuinely needs OS threads to model concurrent transactions racing each other), there is no real parallelism here to model in the first place. The whole simulation runs in one thread with one deterministic order of execution, which is exactly what makes the property-based fuzz testing possible: the same seed always reproduces the same sequence of elections, partitions, and crashes. This module also does not persist anything to disk — `PROGRESS.md`/`AGENTS.md` are explicit that `raft-replication-log` is pure consensus protocol; the "log" it replicates lives entirely in the simulated cluster's memory, and node crash/recovery (`Cluster.crash_node`/`recover_node`) is modeled as temporary unreachability rather than process restart with data loss, since there is no persisted state to lose in the first place.
+`Cluster` is the single implementation of the `Transport` protocol nodes are injected with. Every "RPC" a node sends is, in reality, a direct synchronous function call — `node.transport.send_append_entries(...)` immediately calls the target `RaftNode`'s handler and returns its response (or `None`, standing in for a dropped/timed-out message). This is a deliberate scope decision, spelled out in `cluster.py`'s module docstring: this repo models *the consensus protocol itself*, not a real network stack, so there is nothing to gain from sockets or `asyncio` — and, unlike `lock-manager-deadlock-detector` (which genuinely needs OS threads to model concurrent transactions racing each other), there is no real parallelism here to model in the first place. The whole simulation runs in one thread with one deterministic order of execution, which is exactly what makes the property-based fuzz testing possible: the same seed always reproduces the same sequence of elections, partitions, and crashes. The simulated cluster does not persist anything to disk: its node crash/recovery (`Cluster.crash_node`/`recover_node`) is modeled as temporary unreachability rather than process restart. Persistence and real sockets live in the separate real-deployment modules described next, so the simulation stays deterministic.
+
+### Real deployment: TCP transport and on-disk log
+
+The simulation above is unchanged and still drives the property-based
+tests. Next to it, three modules run the same protocol core as a real
+cluster of 3–5 processes with a static membership:
+
+* **`network.py` — `NetworkNode`.** One listening TCP socket per node,
+  one outbound link per peer, a ticker thread (10 ms ticks, elections
+  after 150–300 ms, heartbeats every 50 ms by default). `TcpTransport`
+  implements `Transport` *asynchronously*: `send_*` only enqueues and
+  returns `None` — exactly what the core already treats as "no response
+  (yet)" — and responses, when they arrive over the network, go through
+  the very same `handle_*_response` functions the simulation uses, which
+  already discard stale replies by term. One `RLock` per node serialises
+  every state mutation (tick, inbound RPC, response, client proposal) and
+  **no network I/O ever happens while holding it** (only enqueueing), so
+  two nodes messaging each other cannot deadlock. Lost connections drop
+  their queued messages and reconnect with backoff; Raft tolerates the
+  loss.
+* **`storage.py` — `DiskStorage`.** Persists `currentTerm`/`votedFor`
+  (atomic `meta.json`: temp file, fsync, rename, fsync of the directory),
+  the log (`log.bin`, append-only records `[len][crc32][index][term][command]`)
+  and the snapshot (`snapshot.bin`, atomic, with CRC; installing or taking
+  one rewrites the log atomically with the entries that follow it). The
+  protocol core still mutates its state in memory and knows nothing about
+  disks: `sync(node)` diffs that state against what was last persisted and
+  writes only the difference (truncated suffix + appended entries, new
+  term/vote, new snapshot), with `fsync`. On load, a torn last record (a
+  crash in the middle of an append) is detected by length/CRC and cut off
+  — that entry was never acknowledged to anyone, because acknowledgement
+  happens after the fsync. A corrupt snapshot is an error, never silence.
+* **The persist-then-publish rule.** After every operation, still under
+  the node lock, `NetworkNode` calls `storage.sync(node)` and only then
+  hands the produced messages to the network and answers the inbound RPC:
+  a vote, an appended entry or a new term reaches stable storage before
+  any other node can observe it (§5.1).
+* **`codec.py`.** Length-prefixed JSON frames (opaque bytes in base64) for
+  the six RPCs; malformed frames raise `CodecError` at the boundary.
+
+Restarting a node with the same data directory restores term, vote, log
+and snapshot (`storage.restore_node`); it then rejoins and catches up like
+any lagging follower. `tests/test_network.py` exercises this with real
+sockets: election and replication on 3 nodes, follower rejection with a
+leader hint, leader crash and fail-over, restart from disk and catch-up,
+whole-cluster restart keeping the committed log, and a 5-node cluster
+surviving two failures. `nanosql` builds its multi-process SQL cluster and
+its chaos/linearizability harness on top of `NetworkNode`.
 
 ## Architecture
 
@@ -87,7 +135,10 @@ src/raft_replication_log/
 ├── replication.py             # propose, replicate_to_peer, handle_append_entries(_response),
 │                              # the §5.4.2 quorum-commit rule
 ├── snapshot.py                  # create_snapshot, handle_install_snapshot(_response)
-├── cluster.py                    # Cluster: the Transport implementation, partition/crash injection
+├── cluster.py                    # Cluster: the simulated Transport, partition/crash injection
+├── codec.py                       # length-prefixed JSON frames for the six RPCs
+├── storage.py                     # DiskStorage: term/vote, append-only log, snapshot, torn-tail recovery
+├── network.py                     # NetworkNode + async TcpTransport: real 3-5 node clusters over TCP
 ├── pipeline.py                     # build_cluster (seeded), elect_leader, replicate_command
 └── __main__.py                      # demo / partition-demo / snapshot-demo / benchmark CLI
 ```
@@ -173,7 +224,7 @@ ruff format --check .
 mypy --strict src/
 ```
 
-The test suite (62 tests) covers: leader election in isolation (randomized-timeout bounds and determinism, vote-granting rules including the log-up-to-date and vote-once-per-term checks, term monotonicity across repeated elections) — 11 tests; log replication (the `AppendEntries` consistency check and fast-backtrack conflict hints, safe truncation that never discards a duplicate resend, and the §5.4.2 direct-vs-indirect commit rule tested explicitly by hand-building a leader with an inherited uncommitted entry) — 11 tests; snapshotting (compaction boundaries, `InstallSnapshot` restoring state and either keeping or discarding a follower's log suffix depending on whether it matches, automatic threshold-triggered compaction, and a lagging node catching up entirely via `InstallSnapshot` after recovering from a crash) — 12 tests; full cluster scenarios matching every item in this project's Definition of Done — election in 3- and 5-node clusters, normal replication reaching every node, recovery after a follower crash and after a leader crash (with leader completeness verified explicitly), a network partition never producing two leaders in the same term, and the isolated minority (even holding the old leader) proven unable to commit anything on its own — 13 tests; and a property-based suite (15 seeds × 500 randomized steps each, mixing ticks, client proposals, partitions, heals, crashes and recoveries) asserting Raft's formal safety invariants — election safety, log matching, state machine safety — after *every single step*, not just at the end, plus a final convergence check once the cluster is healed and left to run — 15 tests.
+The test suite (77 tests) covers — besides the 15 real-deployment tests (`test_codec.py`, `test_storage.py`, `test_network.py`) described above — leader election in isolation (randomized-timeout bounds and determinism, vote-granting rules including the log-up-to-date and vote-once-per-term checks, term monotonicity across repeated elections) — 11 tests; log replication (the `AppendEntries` consistency check and fast-backtrack conflict hints, safe truncation that never discards a duplicate resend, and the §5.4.2 direct-vs-indirect commit rule tested explicitly by hand-building a leader with an inherited uncommitted entry) — 11 tests; snapshotting (compaction boundaries, `InstallSnapshot` restoring state and either keeping or discarding a follower's log suffix depending on whether it matches, automatic threshold-triggered compaction, and a lagging node catching up entirely via `InstallSnapshot` after recovering from a crash) — 12 tests; full cluster scenarios matching every item in this project's Definition of Done — election in 3- and 5-node clusters, normal replication reaching every node, recovery after a follower crash and after a leader crash (with leader completeness verified explicitly), a network partition never producing two leaders in the same term, and the isolated minority (even holding the old leader) proven unable to commit anything on its own — 13 tests; and a property-based suite (15 seeds × 500 randomized steps each, mixing ticks, client proposals, partitions, heals, crashes and recoveries) asserting Raft's formal safety invariants — election safety, log matching, state machine safety — after *every single step*, not just at the end, plus a final convergence check once the cluster is healed and left to run — 15 tests.
 
 Two real bugs were found by this test suite before publishing, not hidden:
 
